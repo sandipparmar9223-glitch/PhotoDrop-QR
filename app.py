@@ -1,6 +1,6 @@
-import os, io, re, json, time, shutil, base64, zipfile, secrets, threading, subprocess, tempfile
+import os, io, re, json, time, shutil, base64, zipfile, secrets, threading, subprocess
 from flask import (Flask, request, render_template_string, send_from_directory,
-                   send_file, abort, session, redirect, after_this_request)
+                   send_file, abort, session, redirect)
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from PIL import Image, ImageOps
@@ -12,7 +12,7 @@ META = os.path.join(BASE, 'albums_meta.json')
 IMG = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 VID = {'.mp4', '.mov', '.webm'}
 MAX_FILES = 30
-GRACE = 600
+GRACE = 600  # seconds a one-time album stays alive after its first view
 os.makedirs(UPLOADS, exist_ok=True)
 Image.MAX_IMAGE_PIXELS = 80_000_000
 
@@ -33,10 +33,11 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config.update(SECRET_KEY=secret(), MAX_CONTENT_LENGTH=500 * 1024 * 1024,
                   SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
-lock = threading.Lock()
-fails = {}
+lock = threading.Lock()  # single-process lock: run with ONE worker (see notes)
+fails = {}  # (aid, ip) -> [count, locked_until]
 
 
+# ---------- storage ----------
 def load():
     try:
         with open(META, encoding='utf-8') as f:
@@ -106,6 +107,7 @@ def files_of(aid):
     return sorted(fs, key=lambda f: (os.path.getmtime(os.path.join(d, f)), f))
 
 
+# ---------- media cleaning ----------
 def clean_image(fs, out, ext):
     img = Image.open(fs.stream)
     img.verify()
@@ -114,7 +116,7 @@ def clean_image(fs, out, ext):
     if ext == '.gif':
         img.save(out, save_all=True, loop=img.info.get('loop', 0))
         return
-    img = ImageOps.exif_transpose(img)
+    img = ImageOps.exif_transpose(img)  # fix rotation BEFORE metadata is dropped
     kw = {}
     if ext == '.jpg':
         if img.mode != 'RGB':
@@ -124,10 +126,11 @@ def clean_image(fs, out, ext):
         kw = {'quality': 92}
     elif img.mode not in ('RGB', 'RGBA', 'L', 'P'):
         img = img.convert('RGB')
-    img.save(out, **kw)
+    img.save(out, **kw)  # Pillow writes no EXIF/GPS unless asked to
 
 
 def clean_video(fs, out):
+    """Returns True if metadata was stripped (needs ffmpeg), False if saved as-is."""
     raw = out + '.raw'
     fs.save(raw)
     ff = shutil.which('ffmpeg')
@@ -146,6 +149,7 @@ def clean_video(fs, out):
     return False
 
 
+# ---------- helpers ----------
 def csrf():
     if 't' not in session:
         session['t'] = secrets.token_hex(16)
@@ -182,6 +186,7 @@ def headers(r):
     return r
 
 
+# ---------- UI ----------
 LAYOUT = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
 <title>Fuse: share photos and videos that burn out</title><style>
@@ -229,3 +234,184 @@ HOME = """<h1>Share it. Then it's gone.</h1>
 {% for v,l in [(24,'24 hours'),(96,'4 days'),(120,'5 days')] %}
 <label class="chip"><input type="radio" name="expiry" value="{{ v }}" {{ 'checked' if v==24 }}><span>{{ l }}</span></label>{% endfor %}</div>
 <div class="lab">Opens allowed</div><div class="chips">
+{% for v,l in [(0,'Unlimited'),(1,'Once'),(5,'5 times'),(25,'25 times')] %}
+<label class="chip"><input type="radio" name="max_views" value="{{ v }}" {{ 'checked' if v==0 }}><span>{{ l }}</span></label>{% endfor %}</div>
+<label for="pin">PIN (optional, 4 to 6 digits)</label>
+<input type="password" id="pin" name="pin" inputmode="numeric" pattern="\\d{4,6}" maxlength="6" autocomplete="off" placeholder="Leave empty for no PIN">
+<label class="drop" for="f"><b id="fl">Choose photos or videos</b>
+<small>JPG, PNG, WEBP, GIF, MP4, MOV, WEBM. Up to 30 files, 500 MB total.</small>
+<input type="file" id="f" name="files" multiple accept="image/*,video/*" hidden
+onchange="fl.textContent=this.files.length?this.files.length+' file(s) selected':'Choose photos or videos'"></label>
+<button class="btn" name="b" type="submit">Create QR code</button></form></div>
+{% if qr %}<div class="res"><h1 style="font-size:26px">Your album is live</h1>
+<img class="qr" src="data:image/png;base64,{{ qr }}" alt="QR code for the album link">
+<div class="link"><input type="text" id="u" value="{{ url }}" readonly aria-label="Album link">
+<button type="button" onclick="u.select();navigator.clipboard&&navigator.clipboard.writeText(u.value);this.textContent='Copied'">Copy</button></div>
+<p class="meta">Deletes in {{ left }}{% if mv %}, or after {{ mv }} open(s){% endif %}{% if pin %}. PIN protected{% endif %}.</p>
+{% if raw_video %}<div class="warn">ffmpeg is not installed on this server, so location data inside videos was not removed. Photos were cleaned.</div>{% endif %}
+<form method="POST" action="/delete/{{ aid }}" onsubmit="return confirm('Delete this album now?')">
+<input type="hidden" name="t" value="{{ t }}"><input type="hidden" name="k" value="{{ owner }}">
+<button class="btn alt" type="submit">Delete album now</button></form></div>{% endif %}
+<p class="foot">Photos are re-encoded and stripped of GPS and camera data. Albums are private to people with the link.</p>"""
+
+PIN = """<h1>This album is locked</h1><p class="sub">Enter the PIN the sender gave you.</p>
+<div class="card">{% if error %}<div class="err">{{ error }}</div>{% endif %}
+<form method="POST"><input type="hidden" name="t" value="{{ t }}">
+<label for="pin">PIN</label><input type="password" id="pin" name="pin" inputmode="numeric" maxlength="6" autocomplete="off" autofocus>
+<button class="btn" type="submit">Unlock album</button></form></div>"""
+
+ALBUM = """<h1>{{ title or 'Shared album' }}</h1>
+<p class="sub"><span class="timer">Burns out in {{ left }}</span>{% if mv %} &nbsp;Opens used: {{ views }} of {{ mv }}{% endif %}</p>
+<div class="grid">{% for f in files %}{% if f.rsplit('.',1)[1] in ['mp4','mov','webm'] %}
+<video src="/m/{{ aid }}/{{ f }}" controls preload="metadata" playsinline></video>
+{% else %}<a href="/m/{{ aid }}/{{ f }}" target="_blank" rel="noopener"><img src="/m/{{ aid }}/{{ f }}" alt="" loading="lazy"></a>{% endif %}{% endfor %}</div>
+<a class="btn" style="text-decoration:none;text-align:center" href="/zip/{{ aid }}">Download all as ZIP</a>"""
+
+GONE = """<h1>This album is gone</h1><p class="sub">It expired, hit its open limit, or the sender deleted it. Ask them to share a new one.</p>
+<a class="btn" style="text-decoration:none;text-align:center" href="/">Make your own album</a>"""
+
+
+def page(body, status=200, **ctx):
+    return render_template_string(LAYOUT.replace('<!--BODY-->', body), t=csrf(), **ctx), status
+
+
+# ---------- routes ----------
+@app.route('/', methods=['GET', 'POST'])
+def home():
+    if request.method == 'GET':
+        return page(HOME)
+    if not csrf_ok():
+        return page(HOME, 400, error='Session expired. Please try again.')
+    up = [f for f in request.files.getlist('files') if f and f.filename]
+    pin = request.form.get('pin', '').strip()
+    expiry = request.form.get('expiry', '24')
+    views = request.form.get('max_views', '0')
+    if not up:
+        return page(HOME, 400, error='Pick at least one photo or video.')
+    if len(up) > MAX_FILES:
+        return page(HOME, 400, error=f'Please upload {MAX_FILES} files or fewer at a time.')
+    if pin and not re.fullmatch(r'\d{4,6}', pin):
+        return page(HOME, 400, error='PIN must be 4 to 6 digits.')
+    hours = int(expiry) if expiry in ('24', '96', '120') else 24
+    mv = int(views) if views in ('0', '1', '5', '25') else 0
+
+    aid, owner = secrets.token_hex(8), secrets.token_urlsafe(16)
+    os.makedirs(adir(aid))
+    saved, raw_video = 0, False
+    for fs in up:
+        ext = os.path.splitext(fs.filename)[1].lower()
+        ext = '.jpg' if ext == '.jpeg' else ext
+        if ext not in IMG and ext not in VID:
+            continue
+        out = os.path.join(adir(aid), secrets.token_hex(5) + ext)
+        try:
+            if ext in VID:
+                raw_video |= not clean_video(fs, out)
+            else:
+                clean_image(fs, out, ext)
+            saved += 1
+        except Exception:
+            if os.path.exists(out):
+                os.remove(out)
+    if not saved:
+        rm(aid)
+        return page(HOME, 400, error='None of those files could be read. Use JPG, PNG, WEBP, GIF, MP4, MOV or WEBM.')
+
+    with lock:
+        m = load()
+        m[aid] = {'title': request.form.get('title', '').strip()[:80],
+                  'expires_at': time.time() + hours * 3600, 'max_views': mv, 'views': 0,
+                  'pin': generate_password_hash(pin) if pin else '',
+                  'owner': generate_password_hash(owner)}
+        save(m)
+    url = request.host_url + 'a/' + aid
+    buf = io.BytesIO()
+    qrcode.make(url, box_size=8, border=2).save(buf, format='PNG')
+    return page(HOME, qr=base64.b64encode(buf.getvalue()).decode(), url=url, aid=aid, owner=owner,
+                left='24 hours' if hours == 24 else f'{hours // 24} days',
+                mv=mv, pin=bool(pin), raw_video=raw_video)
+
+
+@app.route('/a/<aid>', methods=['GET', 'POST'])
+def view(aid):
+    i = get_album(aid)
+    if not i:
+        return page(GONE, 404)
+    if i['pin'] and aid not in session.get('ok', []):
+        err = None
+        if request.method == 'POST':
+            if not csrf_ok():
+                abort(400)
+            k, now = (aid, request.remote_addr), time.time()
+            c, until = fails.get(k, [0, 0])
+            if now < until:
+                err = 'Too many wrong tries. Wait a few minutes and try again.'
+            elif check_password_hash(i['pin'], request.form.get('pin', '')):
+                fails.pop(k, None)
+                session['ok'] = (session.get('ok', []) + [aid])[-40:]
+                return redirect(request.path)
+            else:
+                c += 1
+                fails[k] = [0, now + 600] if c >= 5 else [c, 0]
+                err = 'Wrong PIN.'
+        return page(PIN, 401 if err else 200, error=err)
+    if aid not in session.get('seen', []):
+        with lock:
+            m = load()
+            j = m.get(aid)
+            if not j or (j['max_views'] and j['views'] >= j['max_views']):
+                return page(GONE, 410)
+            j['views'] += 1
+            j['last_view'] = time.time()
+            save(m)
+            i = j
+        session['seen'] = (session.get('seen', []) + [aid])[-40:]
+    fs = files_of(aid)
+    if not fs:
+        return page(GONE, 404)
+    return page(ALBUM, title=i['title'], files=fs, aid=aid, left=left(i), mv=i['max_views'], views=i['views'])
+
+
+@app.route('/m/<aid>/<name>')
+def media(aid, name):
+    i = get_album(aid)
+    if not i or not valid_name(name) or not allowed(aid, i):
+        abort(404)
+    return send_from_directory(adir(aid), name, conditional=True)
+
+
+@app.route('/zip/<aid>')
+def zipall(aid):
+    i = get_album(aid)
+    if not i or not allowed(aid, i):
+        abort(404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as z:
+        for n, f in enumerate(files_of(aid), 1):
+            z.write(os.path.join(adir(aid), f), f'{n:02d}_{f}')
+    buf.seek(0)
+    return send_file(buf, mimetype='application/zip', as_attachment=True, download_name='album.zip')
+
+
+@app.route('/delete/<aid>', methods=['POST'])
+def delete(aid):
+    if not csrf_ok():
+        abort(400)
+    with lock:
+        m = load()
+        i = m.get(aid) if valid_aid(aid) else None
+        if i and check_password_hash(i['owner'], request.form.get('k', '')):
+            rm(aid)
+            del m[aid]
+            save(m)
+            return page(GONE.replace('This album is gone', 'Album deleted'), 200)
+    abort(403)
+
+
+@app.route('/healthz')
+def health():
+    return 'ok'
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
