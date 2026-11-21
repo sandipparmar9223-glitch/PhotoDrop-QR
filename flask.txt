@@ -1,5 +1,0 @@
-flask
-qrcode
-pillow
-werkzeug
-gunicorn
