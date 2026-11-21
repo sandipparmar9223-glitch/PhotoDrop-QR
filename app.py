@@ -1,415 +1,231 @@
-import os
-import re
-import socket
-import threading
-import webbrowser
-from flask import Flask, request, render_template_string
+import os, io, re, json, time, shutil, base64, zipfile, secrets, threading, subprocess, tempfile
+from flask import (Flask, request, render_template_string, send_from_directory,
+                   send_file, abort, session, redirect, after_this_request)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
+from PIL import Image, ImageOps
+import qrcode
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+UPLOADS = os.path.join(BASE, 'uploads')
+META = os.path.join(BASE, 'albums_meta.json')
+IMG = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+VID = {'.mp4', '.mov', '.webm'}
+MAX_FILES = 30
+GRACE = 600
+os.makedirs(UPLOADS, exist_ok=True)
+Image.MAX_IMAGE_PIXELS = 80_000_000
+
+
+def secret():
+    k = os.environ.get('FLASK_SECRET_KEY')
+    if k:
+        return k
+    p = os.path.join(BASE, '.secret_key')
+    if os.path.exists(p):
+        return open(p).read().strip()
+    k = secrets.token_hex(32)
+    open(p, 'w').write(k)
+    return k
+
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY') or os.urandom(24).hex()
-PORT = 5000
-
-# ==============================================================================
-# यहाँ से आप बाद में कभी भी वेबसाइट का नाम, रंग, टेक्स्ट और सेवाएं बदल सकते हैं
-# ==============================================================================
-SITE_CONFIG = {
-    "brand_badge": "PY",
-    "brand_name": "WebCraft Python",
-    "tagline": "● Python से बना सुरक्षित और लचीला वेब सिस्टम",
-    "primary_color": "#0f172a",
-    "accent_color": "#2563eb",
-    "accent_hover": "#1d4ed8",
-    "hero_title": "आसानी से बदलने और बढ़ाने लायक सुरक्षित वेबसाइट",
-    "hero_subtitle": "पूरा लुक और लॉजिक Python के भीतर तैयार है, ताकि आप जब चाहें तब नाम, रंग, सेवाएं या फ़ीचर्स तुरंत अपडेट कर सकें।",
-    "hero_cta_text": "संपर्क करें",
-    "services_heading": "हमारी मुख्य सेवाएं",
-    "services": [
-        {
-            "title": "आसान कस्टमाइज़ेशन",
-            "desc": "SITE_CONFIG में बदलाव करते ही वेबसाइट का टेक्स्ट, ब्रांड नाम और थीम रंग तुरंत अपडेट हो जाते हैं।"
-        },
-        {
-            "title": "सुरक्षित आर्किटेक्चर",
-            "desc": "साफ HTML/CSS, सुरक्षित हेडर, rel='noopener noreferrer' और बिना अनजान बाहरी स्क्रिप्ट के तैयार कोड।"
-        },
-        {
-            "title": "मोबाइल और डेस्कटॉप रेडी",
-            "desc": "हर स्क्रीन साइज के अनुसार खुद-ब-खुद ढलने वाला रिस्पॉन्सिव लेआउट।"
-        },
-    ],
-    "footer_text": "© 2026 WebCraft Python. सर्वाधिकार सुरक्षित।",
-    "external_link_label": "प्राइवेसी व सुरक्षा जानकारी",
-    "external_link_url": "https://example.com/privacy",
-}
-# ==============================================================================
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config.update(SECRET_KEY=secret(), MAX_CONTENT_LENGTH=500 * 1024 * 1024,
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
+lock = threading.Lock()
+fails = {}
 
 
-def get_local_ip():
+def load():
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with open(META, encoding='utf-8') as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
     except Exception:
-        return "127.0.0.1"
+        return {}
 
 
-def sanitize_text(value, max_len=120):
-    cleaned = re.sub(r'[\x00-\x1f\x7f]', '', str(value or '')).strip()
-    return cleaned[:max_len]
+def save(m):
+    tmp = META + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(m, f, ensure_ascii=False)
+    os.replace(tmp, META)
 
 
-def sanitize_safe_url(url_str):
-    u = str(url_str or '').strip()
-    if u.startswith(('https://', 'http://')):
-        return u
-    return "https://example.com"
+def adir(aid):
+    return os.path.join(UPLOADS, aid)
 
 
-PAGE_TEMPLATE = """<!DOCTYPE html>
-<html lang="hi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="X-Content-Type-Options" content="nosniff">
-<title>{{ cfg.brand_name }} | {{ cfg.hero_title }}</title>
-<style>
-* {
-    margin: 0;
-    padding: 0;
-    box-sizing: border-box;
-    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-    -webkit-user-select: none;
-    -moz-user-select: none;
-    -ms-user-select: none;
-    user-select: none;
-}
-img, svg {
-    -webkit-user-drag: none;
-    user-drag: none;
-}
-:root {
-    --primary: {{ cfg.primary_color }};
-    --accent: {{ cfg.accent_color }};
-    --accent-hover: {{ cfg.accent_hover }};
-    --bg-light: #f8fafc;
-    --text-main: #334155;
-    --white: #ffffff;
-}
-body {
-    background-color: var(--bg-light);
-    color: var(--text-main);
-    line-height: 1.6;
-    overflow-x: hidden;
-}
-header {
-    background-color: var(--white);
-    border-bottom: 1px solid #e2e8f0;
-    position: sticky;
-    top: 0;
-    z-index: 100;
-}
-.navbar {
-    max-width: 1140px;
-    margin: 0 auto;
-    padding: 14px 20px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 12px;
-}
-.logo {
-    font-size: 20px;
-    font-weight: 800;
-    color: var(--primary);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-.logo-badge {
-    background: var(--accent);
-    color: var(--white);
-    padding: 4px 9px;
-    border-radius: 8px;
-    font-size: 13px;
-}
-.status-tag {
-    font-size: 12px;
-    font-weight: 700;
-    color: #15803d;
-}
-.hero {
-    background: linear-gradient(135deg, var(--primary) 0%, #1e293b 100%);
-    color: var(--white);
-    padding: 64px 20px;
-    text-align: center;
-}
-.hero-inner {
-    max-width: 780px;
-    margin: 0 auto;
-}
-.hero h1 {
-    font-size: 34px;
-    line-height: 1.25;
-    margin-bottom: 14px;
-}
-.hero p {
-    font-size: 16px;
-    color: #cbd5e1;
-    margin-bottom: 24px;
-}
-.btn {
-    display: inline-block;
-    background-color: var(--accent);
-    color: var(--white);
-    padding: 12px 24px;
-    border-radius: 10px;
-    text-decoration: none;
-    font-weight: 700;
-    font-size: 15px;
-    border: none;
-    cursor: pointer;
-    transition: background-color 0.2s, transform 0.2s;
-}
-.btn:hover {
-    background-color: var(--accent-hover);
-    transform: translateY(-1px);
-}
-.container {
-    max-width: 1140px;
-    margin: 0 auto;
-    padding: 52px 20px;
-}
-.section-title {
-    text-align: center;
-    font-size: 26px;
-    color: var(--primary);
-    margin-bottom: 28px;
-}
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-    gap: 20px;
-}
-.card {
-    background: var(--white);
-    padding: 24px;
-    border-radius: 14px;
-    border: 1px solid #e2e8f0;
-    border-top: 4px solid var(--accent);
-    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
-}
-.card h3 {
-    color: var(--primary);
-    font-size: 18px;
-    margin-bottom: 10px;
-}
-.contact-box {
-    background: var(--white);
-    max-width: 640px;
-    margin: 0 auto;
-    padding: 32px 24px;
-    border-radius: 16px;
-    border: 1px solid #e2e8f0;
-    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
-}
-.form-group {
-    margin-bottom: 16px;
-}
-.form-group label {
-    display: block;
-    font-weight: 700;
-    color: var(--primary);
-    margin-bottom: 6px;
-    font-size: 14px;
-}
-.form-group input,
-.form-group textarea {
-    width: 100%;
-    padding: 11px 14px;
-    border: 1.5px solid #cbd5e1;
-    border-radius: 10px;
-    font-size: 14px;
-    outline: none;
-    -webkit-user-select: text;
-    -moz-user-select: text;
-    -ms-user-select: text;
-    user-select: text;
-}
-.form-group input:focus,
-.form-group textarea:focus {
-    border-color: var(--accent);
-}
-.msg-box {
-    margin-top: 14px;
-    padding: 12px 14px;
-    border-radius: 10px;
-    background: #f0fdf4;
-    border: 1px solid #bbf7d0;
-    color: #166534;
-    font-weight: 700;
-    font-size: 14px;
-}
-footer {
-    background: var(--primary);
-    color: #94a3b8;
-    text-align: center;
-    padding: 28px 16px;
-    font-size: 14px;
-}
-footer a {
-    color: var(--white);
-    text-decoration: none;
-    font-weight: 600;
-}
-@media (max-width: 768px) {
-    .hero { padding: 44px 16px; }
-    .hero h1 { font-size: 25px; }
-    .container { padding: 36px 14px; }
-    .contact-box { padding: 24px 16px; }
-}
-</style>
-</head>
-<body>
-<header>
-    <nav class="navbar">
-        <div class="logo">
-            <span class="logo-badge">{{ cfg.brand_badge }}</span>
-            <span>{{ cfg.brand_name }}</span>
-        </div>
-        <div class="status-tag">{{ cfg.tagline }}</div>
-    </nav>
-</header>
+def rm(aid):
+    shutil.rmtree(adir(aid), ignore_errors=True)
 
-<section class="hero">
-    <div class="hero-inner">
-        <h1>{{ cfg.hero_title }}</h1>
-        <p>{{ cfg.hero_subtitle }}</p>
-        <a href="#contact" class="btn">{{ cfg.hero_cta_text }}</a>
-    </div>
-</section>
 
-<section class="container">
-    <h2 class="section-title">{{ cfg.services_heading }}</h2>
-    <div class="grid">
-        {% for item in cfg.services %}
-        <div class="card">
-            <h3>{{ item.title }}</h3>
-            <p>{{ item.desc }}</p>
-        </div>
-        {% endfor %}
-    </div>
-</section>
+def dead(i, now):
+    mv = i.get('max_views', 0)
+    return now > i.get('expires_at', 0) or (
+        mv and i.get('views', 0) >= mv and now > i.get('last_view', now) + GRACE)
 
-<section id="contact" class="container" style="padding-top: 0;">
-    <div class="contact-box">
-        <h2 class="section-title" style="margin-bottom: 18px;">{{ cfg.hero_cta_text }}</h2>
-        <form method="POST" action="/#contact">
-            <div class="form-group">
-                <label for="name">आपका नाम *</label>
-                <input type="text" id="name" name="name" maxlength="80" required placeholder="अपना नाम लिखें">
-            </div>
-            <div class="form-group">
-                <label for="message">आपका संदेश या बदलाव की ज़रूरत *</label>
-                <textarea id="message" name="message" rows="4" maxlength="500" required placeholder="यहाँ लिखें..."></textarea>
-            </div>
-            <button type="submit" class="btn" style="width: 100%;">संदेश भेजें</button>
-        </form>
-        {% if submitted_reply %}
-        <div class="msg-box">{{ submitted_reply }}</div>
-        {% endif %}
-    </div>
-</section>
 
-<footer>
-    <p>{{ cfg.footer_text }}</p>
-    <p style="margin-top: 8px;">
-        <a href="{{ safe_ext_url }}" target="_blank" rel="noopener noreferrer">{{ cfg.external_link_label }}</a>
-    </p>
-</footer>
+def sweeper():
+    while True:
+        try:
+            with lock:
+                m, now = load(), time.time()
+                gone = [a for a, i in m.items() if dead(i, now)]
+                for a in gone:
+                    rm(a)
+                    del m[a]
+                if gone:
+                    save(m)
+        except Exception:
+            pass
+        time.sleep(60)
 
-<script>
-(function() {
-    'use strict';
 
-    document.addEventListener('contextmenu', function(e) {
-        e.preventDefault();
-    });
+threading.Thread(target=sweeper, daemon=True).start()
 
-    document.addEventListener('dragstart', function(e) {
-        e.preventDefault();
-    });
+valid_aid = lambda a: isinstance(a, str) and re.fullmatch(r'[0-9a-f]{16}', a)
+valid_name = lambda n: isinstance(n, str) and re.fullmatch(
+    r'[0-9a-f]{10}\.(jpg|png|webp|gif|mp4|mov|webm)', n)
 
-    document.addEventListener('copy', function(e) {
-        const active = document.activeElement;
-        if (!active || !['INPUT', 'TEXTAREA'].includes(active.tagName)) {
-            e.preventDefault();
-        }
-    });
 
-    document.addEventListener('cut', function(e) {
-        const active = document.activeElement;
-        if (!active || !['INPUT', 'TEXTAREA'].includes(active.tagName)) {
-            e.preventDefault();
-        }
-    });
+def get_album(aid):
+    if not valid_aid(aid):
+        return None
+    with lock:
+        i = load().get(aid)
+    return None if not i or dead(i, time.time()) else i
 
-    document.addEventListener('keydown', function(e) {
-        if (
-            (e.ctrlKey && ['c', 'C', 'u', 'U', 's', 'S', 'p', 'P'].includes(e.key)) ||
-            (e.ctrlKey && e.shiftKey && ['I', 'i', 'J', 'j', 'C', 'c'].includes(e.key)) ||
-            e.key === 'F12'
-        ) {
-            e.preventDefault();
-        }
-    });
-})();
-</script>
-</body>
-</html>
-"""
+
+def files_of(aid):
+    d = adir(aid)
+    if not os.path.isdir(d):
+        return []
+    fs = [f for f in os.listdir(d) if valid_name(f)]
+    return sorted(fs, key=lambda f: (os.path.getmtime(os.path.join(d, f)), f))
+
+
+def clean_image(fs, out, ext):
+    img = Image.open(fs.stream)
+    img.verify()
+    fs.stream.seek(0)
+    img = Image.open(fs.stream)
+    if ext == '.gif':
+        img.save(out, save_all=True, loop=img.info.get('loop', 0))
+        return
+    img = ImageOps.exif_transpose(img)
+    kw = {}
+    if ext == '.jpg':
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        kw = {'quality': 92, 'optimize': True}
+    elif ext == '.webp':
+        kw = {'quality': 92}
+    elif img.mode not in ('RGB', 'RGBA', 'L', 'P'):
+        img = img.convert('RGB')
+    img.save(out, **kw)
+
+
+def clean_video(fs, out):
+    raw = out + '.raw'
+    fs.save(raw)
+    ff = shutil.which('ffmpeg')
+    if ff:
+        try:
+            r = subprocess.run([ff, '-y', '-i', raw, '-map_metadata', '-1', '-c', 'copy', out],
+                               capture_output=True, timeout=300)
+            if r.returncode == 0 and os.path.getsize(out) > 0:
+                os.remove(raw)
+                return True
+        except Exception:
+            pass
+    if os.path.exists(out):
+        os.remove(out)
+    os.replace(raw, out)
+    return False
+
+
+def csrf():
+    if 't' not in session:
+        session['t'] = secrets.token_hex(16)
+    return session['t']
+
+
+def csrf_ok():
+    return secrets.compare_digest(request.form.get('t', ''), session.get('t', 'x'))
+
+
+def allowed(aid, i):
+    if i.get('pin') and aid not in session.get('ok', []):
+        return False
+    if i.get('max_views') and aid not in session.get('seen', []):
+        return False
+    return True
+
+
+def left(i):
+    s = max(0, int(i['expires_at'] - time.time()))
+    h, m = s // 3600, s % 3600 // 60
+    return f'{h // 24}d {h % 24}h' if h >= 24 else f'{h}h {m}m'
 
 
 @app.after_request
-def add_security_headers(response):
-    response.headers['Content-Security-Policy'] = (
-        "default-src 'self'; "
-        "img-src 'self' data:; "
-        "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "frame-ancestors 'none'; "
-        "base-uri 'self';"
-    )
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    return response
+def headers(r):
+    r.headers.update({
+        'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
+        'X-Robots-Tag': 'noindex, nofollow, noarchive', 'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; media-src 'self'; "
+                                   "style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'"})
+    if request.path != '/':
+        r.headers['Cache-Control'] = 'no-store'
+    return r
 
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    submitted_reply = None
-    if request.method == 'POST':
-        user_name = sanitize_text(request.form.get('name'), 80)
-        user_msg = sanitize_text(request.form.get('message'), 500)
-        if user_name and user_msg:
-            submitted_reply = f"धन्यवाद, {user_name}! आपका संदेश सुरक्षित रूप से दर्ज कर लिया गया है।"
+LAYOUT = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<title>Fuse: share photos and videos that burn out</title><style>
+:root{--bg:#dde6ea;--ink:#14213d;--mute:#51607a;--card:#f7fafb;--line:#b9c7cf;--hot:#ff5a1f;--sea:#12706b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 Verdana,Tahoma,sans-serif}
+.wrap{max-width:560px;margin:0 auto;padding:22px 16px 60px}
+.brand{font:800 30px/1 Rockwell,'Roboto Slab',Georgia,serif;letter-spacing:-1px;display:flex;align-items:center;gap:10px}
+.fuse{width:46px;height:8px;border-radius:8px;background:linear-gradient(90deg,var(--ink) 70%,var(--hot) 70%);position:relative}
+.fuse:after{content:"";position:absolute;right:-3px;top:-4px;width:14px;height:14px;border-radius:50%;background:var(--hot);box-shadow:0 0 0 4px #ff5a1f33;animation:b 1.4s infinite alternate}
+@keyframes b{to{box-shadow:0 0 0 8px #ff5a1f00}}@media(prefers-reduced-motion:reduce){.fuse:after{animation:none}}
+h1{font:800 34px/1.1 Rockwell,'Roboto Slab',Georgia,serif;margin:26px 0 8px;letter-spacing:-1px}
+.sub{color:var(--mute);margin:0 0 22px}
+.card{background:var(--card);border:2px solid var(--ink);border-radius:6px 22px 6px 22px;padding:20px;box-shadow:6px 6px 0 var(--ink)}
+label,.lab{display:block;font-weight:700;font-size:14px;margin:16px 0 6px}
+input[type=text],input[type=password]{width:100%;padding:12px;border:2px solid var(--line);border-radius:10px;font:inherit;background:#fff}
+input:focus-visible,button:focus-visible,a:focus-visible,summary:focus-visible,.chip:focus-within{outline:3px solid var(--hot);outline-offset:2px}
+.chips{display:flex;flex-wrap:wrap;gap:8px}.chip{position:relative}
+.chip input{position:absolute;opacity:0}.chip span{display:block;padding:9px 14px;border:2px solid var(--line);border-radius:30px;background:#fff;font-size:14px;cursor:pointer}
+.chip input:checked+span{background:var(--ink);border-color:var(--ink);color:#fff}
+.drop{display:block;margin-top:18px;border:2px dashed var(--mute);border-radius:12px;padding:26px 12px;text-align:center;cursor:pointer;background:#fff}
+.drop b{font:700 18px Rockwell,Georgia,serif}.drop small{display:block;color:var(--mute)}
+.btn{display:block;width:100%;margin-top:18px;padding:14px;border:2px solid var(--ink);border-radius:12px;background:var(--hot);color:#fff;font:800 17px Verdana,sans-serif;cursor:pointer}
+.btn.alt{background:#fff;color:var(--ink)}.btn:disabled{opacity:.6}
+.err{background:#ffe3dc;border:2px solid var(--hot);padding:10px 12px;border-radius:10px;margin-bottom:14px;font-weight:700;font-size:14px}
+.warn{background:#fff3c4;border:2px solid #d9a800;padding:10px 12px;border-radius:10px;font-size:13px;margin-top:12px}
+.res{margin-top:24px;text-align:center}.res img.qr{width:220px;height:220px;image-rendering:pixelated;border:2px solid var(--ink);border-radius:8px;padding:8px;background:#fff}
+.link{display:flex;gap:6px;margin-top:12px}.link input{flex:1;font-size:13px}.link button{padding:0 14px;border:2px solid var(--ink);border-radius:10px;background:var(--sea);color:#fff;font-weight:700;cursor:pointer}
+.meta{color:var(--mute);font-size:13px;margin-top:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:16px}
+.grid a,.grid video{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:2px solid var(--ink);background:#000}
+.grid img{width:100%;height:100%;object-fit:cover;display:block;border-radius:6px}.grid a{overflow:hidden}
+.timer{display:inline-block;background:var(--ink);color:#fff;border-radius:30px;padding:5px 14px;font-size:13px;font-weight:700}
+.foot{margin-top:22px;color:var(--mute);font-size:12px;text-align:center}
+</style></head><body><div class="wrap"><div class="brand">Fuse<i class="fuse"></i></div>
+<!--BODY--></div></body></html>"""
 
-    safe_cfg = dict(SITE_CONFIG)
-    safe_ext_url = sanitize_safe_url(SITE_CONFIG.get("external_link_url"))
-    return render_template_string(
-        PAGE_TEMPLATE,
-        cfg=safe_cfg,
-        safe_ext_url=safe_ext_url,
-        submitted_reply=submitted_reply
-    )
-
-
-if __name__ == '__main__':
-    ip = get_local_ip()
-    print(f"\nलोकल लिंक: http://127.0.0.1:{PORT}")
-    print(f"एक ही Wi-Fi/नेटवर्क से लिंक: http://{ip}:{PORT}\n")
-    threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
-    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+HOME = """<h1>Share it. Then it's gone.</h1>
+<p class="sub">Upload photos or videos, get a QR code. The album deletes itself when the fuse runs out.</p>
+<div class="card">{% if error %}<div class="err">{{ error }}</div>{% endif %}
+<form method="POST" enctype="multipart/form-data" onsubmit="b.disabled=true;b.textContent='Uploading, please wait...'">
+<input type="hidden" name="t" value="{{ t }}">
+<label for="title">Album name (optional)</label>
+<input type="text" id="title" name="title" maxlength="80" placeholder="Goa trip, Sam's birthday">
+<div class="lab">Delete after</div><div class="chips">
+{% for v,l in [(24,'24 hours'),(96,'4 days'),(120,'5 days')] %}
+<label class="chip"><input type="radio" name="expiry" value="{{ v }}" {{ 'checked' if v==24 }}><span>{{ l }}</span></label>{% endfor %}</div>
+<div class="lab">Opens allowed</div><div class="chips">
